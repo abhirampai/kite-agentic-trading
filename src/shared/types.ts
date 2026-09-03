@@ -8,6 +8,19 @@ export interface KiteCredentials {
   userName?: string;
 }
 
+export type OpenCodePlan = 'zen' | 'go';
+
+export interface LLMSettings {
+  provider: 'OpenAI' | 'Anthropic' | 'Gemini' | 'OpenRouter' | 'Ollama' | 'OpenCode';
+  baseUrl: string;
+  model: string;
+  openCodePlan?: OpenCodePlan;
+  apiKey: string;
+  apiKeyConfigured?: boolean;
+  temperature?: number;
+  maxTokens?: number;
+}
+
 export interface AuthState {
   isLoggedIn: boolean;
   credentials: KiteCredentials | null;
@@ -292,6 +305,7 @@ export interface WatchlistItem {
 
 export interface AppSettings {
   credentials: KiteCredentials;
+  llm: LLMSettings;
   risk: RiskConfig;
   strategies: StrategyConfig;
   watchlist: string[]; // ["NSE:RELIANCE", "NSE:INFY", ...]
@@ -346,4 +360,87 @@ export interface DashboardSummary {
   openPositionsCount: number;
   availableMargin: number;
   usedMargin: number;
+}
+
+// ─── Journal & Analytics ──────────────────────────────────────────
+
+export interface JournalTrade {
+  id: string;
+  tradingsymbol: string;
+  exchange: string;
+  direction: 'BUY' | 'SELL';
+  product: string;
+  strategy: string;
+  signal_id: string | null;
+  reasoning: string | null;
+  confidence: number | null;
+  entry_price: number;
+  quantity: number;
+  stop_loss: number;
+  target: number;
+  entry_time: string;
+  exit_price: number | null;
+  exit_time: string | null;
+  exit_reason: string | null;
+  pnl: number | null;
+  status: 'OPEN' | 'CLOSED';
+  confluence_snapshot: string | null;
+  indicator_snapshot: string | null;
+}
+
+export interface TradeEvent {
+  id: string;
+  trade_id: string;
+  timestamp: string;
+  event_type: string;
+  details: string; // JSON string
+}
+
+export interface StrategyExpectancy {
+  strategy: string;
+  total_trades: number;
+  win_rate_pct: number;
+  profit_factor: number | null;
+  avg_r_multiple: number;
+  avg_hold_time_mins: number;
+}
+
+export interface ConfluenceValidation {
+  confluence_count: number;
+  total_trades: number;
+  win_rate_pct: number;
+  total_pnl: number;
+}
+
+export interface ConfidenceCalibration {
+  confidence_bucket: string;
+  total_trades: number;
+  actual_win_rate_pct: number;
+}
+
+export interface ExitReasonEffectiveness {
+  exit_reason: string;
+  total_trades: number;
+  win_rate_pct: number;
+  total_pnl: number;
+}
+
+export interface TradeReplayData {
+  trade: JournalTrade;
+  candles: Candle[];
+}
+
+export interface WhatIfAnalysis {
+  eod_pnl: number;
+  target_hit: boolean;
+  target_hit_time: string | null;
+  wider_stop_price: number;
+  wider_stop_hit: boolean;
+  wider_stop_pnl: number;
+  actual_pnl: number;
+}
+
+export interface LLMPostMortem {
+  analysis?: string;
+  error?: string;
 }

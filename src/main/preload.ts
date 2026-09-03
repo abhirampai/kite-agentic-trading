@@ -2,7 +2,11 @@ try {
   const electron = require('electron');
   const channels = require('../shared/ipc-channels');
 
+  const devModeFlag = (process.env.KITE_DEV_MODE || '').toLowerCase();
+  const isDevMode = ['1', 'true', 'yes', 'on'].includes(devModeFlag);
+
   electron.contextBridge.exposeInMainWorld('electronAPI', {
+    isDevMode,
     invoke: (channel: string, ...args: any[]) => electron.ipcRenderer.invoke(channel, ...args),
     on: (channel: string, listener: (...args: any[]) => void) => electron.ipcRenderer.on(channel, listener),
     removeListener: (channel: string, listener: (...args: any[]) => void) => electron.ipcRenderer.removeListener(channel, listener),
@@ -78,6 +82,8 @@ try {
     settings: {
       get: () => electron.ipcRenderer.invoke(channels.SETTINGS_GET),
       save: (settings: any) => electron.ipcRenderer.invoke(channels.SETTINGS_SAVE, settings),
+      saveLlmKey: (key: string) => electron.ipcRenderer.invoke(channels.SETTINGS_SAVE_LLM_KEY, key),
+      discoverModels: (params: any) => electron.ipcRenderer.invoke(channels.SETTINGS_DISCOVER_MODELS, params),
       reset: () => electron.ipcRenderer.invoke(channels.SETTINGS_RESET),
     },
     watchlist: {
@@ -92,6 +98,19 @@ try {
     },
     dashboard: {
       summary: () => electron.ipcRenderer.invoke(channels.DASHBOARD_SUMMARY),
+    },
+    journal: {
+      getTrades: () => electron.ipcRenderer.invoke(channels.JOURNAL_GET_TRADES),
+      getEvents: (tradeId: string) => electron.ipcRenderer.invoke(channels.JOURNAL_GET_EVENTS, tradeId),
+    },
+    analytics: {
+      getStrategyExpectancy: () => electron.ipcRenderer.invoke(channels.ANALYTICS_STRATEGY_EXPECTANCY),
+      getConfluenceValidation: () => electron.ipcRenderer.invoke(channels.ANALYTICS_CONFLUENCE_VALIDATION),
+      getConfidenceCalibration: () => electron.ipcRenderer.invoke(channels.ANALYTICS_CONFIDENCE_CALIBRATION),
+      getExitReasonEffectiveness: () => electron.ipcRenderer.invoke(channels.ANALYTICS_EXIT_REASON),
+      getTradeReplay: (tradeId: string) => electron.ipcRenderer.invoke(channels.ANALYTICS_TRADE_REPLAY, tradeId),
+      getWhatIfAnalysis: (tradeId: string) => electron.ipcRenderer.invoke(channels.ANALYTICS_WHAT_IF, tradeId),
+      getLlmPostMortem: (tradeId: string) => electron.ipcRenderer.invoke(channels.ANALYTICS_LLM_POST_MORTEM, tradeId),
     },
     app: {
       onPythonStatus: (callback: (data: any) => void) => {

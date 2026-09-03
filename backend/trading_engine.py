@@ -6,6 +6,7 @@ import time
 import uuid
 
 from .config import config_manager
+from .journal import journal
 from .kite_client import kite_client
 from .risk_manager import risk_manager
 from .scanner import scanner
@@ -20,7 +21,7 @@ class TradingEngine:
     def __init__(self):
         self.running = False
         self.thread = None
-        self.mode = "confirm"  # auto or confirm
+        self.mode = "auto"  # auto or confirm
         self.interval = 60  # seconds
         self.active_trades = {}  # tradingsymbol -> { sl, target, direction, entry_price, entry_time, original_strategy, stop_order_id, exit_pending, exit_order_id }
         self._instrument_map = {}  # cached symbol -> instrument_token map
@@ -38,6 +39,7 @@ class TradingEngine:
         # that execute_signal is still setting up.
         self._pending_entries: set = set()
         self._tick_size_map = {}
+        self._reserved_entry_margin = 0.0
 
     def _get_tick_size(self, symbol: str, exchange: str = "NSE") -> float:
         if symbol in self._tick_size_map:
@@ -58,7 +60,7 @@ class TradingEngine:
     def _round_to_tick(self, price: float, tick_size: float) -> float:
         return round(round(price / tick_size) * tick_size, 2)
 
-    def start(self, mode: str = "confirm"):
+    def start(self, mode: str = "auto"):
         if self.running:
             return
 
@@ -163,16 +165,16 @@ class TradingEngine:
         else:
             self._notified_cannot_trade = False
 
-        # Use our AI/Algorithmic screener to dynamically find "In Play" stocks from NIFTY 50 + Custom Watchlist
+        # Use our AI/Algorithmic screener to dynamically find "In Play" stocks from NIFTY 100 + Custom Watchlist
         if not hasattr(self, "dynamic_watchlist") or not self.dynamic_watchlist:
-            from .nifty_universe import get_nifty50_universe
+            from .nifty_universe import get_nifty100_universe
             from .screener import screener_engine
 
             custom_watchlist = config_manager.get_watchlist()
-            full_universe = list(set(get_nifty50_universe() + custom_watchlist))
+            full_universe = list(set(get_nifty100_universe() + custom_watchlist))
 
             self._push_log(
-                f"Running algorithmic screener on NIFTY 50 + {len(custom_watchlist)} custom stocks..."
+                f"Running algorithmic screener on NIFTY 100 + {len(custom_watchlist)} custom stocks..."
             )
             self.dynamic_watchlist = screener_engine.generate_daily_watchlist(
                 universe=full_universe, limit=12
@@ -236,33 +238,60 @@ class TradingEngine:
             self._push_log(f"Cannot execute signal {signal['id']}: {reason}")
             return False
 
-        qty = risk_manager.calculate_position_size(
-            signal["entryPrice"], signal["stopLoss"]
-        )
-
         transaction_type = "BUY" if signal["direction"] == "BUY" else "SELL"
         exchange = signal.get("exchange", "NSE")
         tick_size = self._get_tick_size(symbol, exchange)
         entry_price = self._round_to_tick(signal["entryPrice"], tick_size)
 
         try:
-            order_id = kite_client.place_order(
-                variety="regular",
-                exchange=exchange,
-                tradingsymbol=symbol,
-                transaction_type=transaction_type,
-                quantity=qty,
-                product="MIS",
-                order_type="LIMIT",
-                price=entry_price,
-            )
+            baseline_position = self._find_live_position(symbol, signal["direction"])
+            baseline_quantity = abs(baseline_position.get("quantity", 0))
+            # Serialize the margin snapshot, sizing, and submission so concurrent
+            # scanner callbacks cannot reserve the same available margin.
+            with self._trade_lock:
+                margins = kite_client.get_margins()
+                equity_margin = margins.get("equity", {})
+                available = equity_margin.get("available", {})
+                if "live_balance" in available:
+                    available_margin = available["live_balance"]
+                else:
+                    available_margin = equity_margin.get("net", 0)
+                available_margin = max(
+                    0, available_margin - self._reserved_entry_margin
+                )
+
+                qty = risk_manager.calculate_position_size(
+                    entry_price, signal["stopLoss"], available_margin
+                )
+                if qty <= 0:
+                    self._push_log(
+                        f"Cannot execute signal {signal['id']}: insufficient available margin",
+                        level="warning",
+                    )
+                    return False
+
+                reserved_margin = qty * entry_price
+                self._reserved_entry_margin += reserved_margin
+                order_id = kite_client.place_order(
+                    variety="regular",
+                    exchange=exchange,
+                    tradingsymbol=symbol,
+                    transaction_type=transaction_type,
+                    quantity=qty,
+                    product="MIS",
+                    order_type="LIMIT",
+                    price=entry_price,
+                )
             self._push_log(
                 f"Executed {transaction_type} for {symbol}, qty {qty}, order_id {order_id}"
             )
 
             # Wait for fill — NO LOCK held; this blocks up to 15 seconds.
-            position = self._wait_for_entry_fill(signal, order_id)
+            position = self._wait_for_entry_fill(signal, order_id, baseline_quantity)
             if not position:
+                with self._trade_lock:
+                    self._reserved_entry_margin -= reserved_margin
+                    reserved_margin = 0
                 self._push_log(
                     f"Entry order {order_id} for {symbol} not filled. Not tracking as active trade.",
                     level="warning",
@@ -272,6 +301,10 @@ class TradingEngine:
                 except Exception:
                     pass
                 return False
+
+            with self._trade_lock:
+                self._reserved_entry_margin -= reserved_margin
+                reserved_margin = 0
 
             stop_order_id = self._place_protective_stop(
                 signal,
@@ -291,8 +324,44 @@ class TradingEngine:
                 )
                 return False
 
+            # Get confluence snapshot for journal
+            try:
+                token = self._ensure_instrument_map().get(symbol)
+                evaluation = scanner.evaluate_position(symbol, token) if token else {}
+            except Exception as e:
+                self._push_log(
+                    f"Error fetching confluence snapshot for {symbol}: {e}",
+                    level="warning",
+                )
+                evaluation = {}
+
+            trade_id = str(uuid.uuid4())
+            try:
+                journal.open_trade(
+                    trade_id=trade_id,
+                    tradingsymbol=symbol,
+                    exchange=position.get("exchange", exchange),
+                    direction=signal["direction"],
+                    product=position.get("product", "MIS"),
+                    strategy=signal.get("strategy", "unknown"),
+                    entry_price=position.get("averagePrice", signal["entryPrice"]),
+                    quantity=abs(position.get("quantity", qty)) or qty,
+                    stop_loss=signal["stopLoss"],
+                    target=signal["target"],
+                    signal_id=signal.get("id"),
+                    reasoning=signal.get("reasoning"),
+                    confidence=signal.get("confidence"),
+                    confluence_snapshot=evaluation,
+                    indicator_snapshot=signal.get("indicators"),
+                )
+            except Exception as e:
+                self._push_log(
+                    f"Failed to log trade open for {symbol}: {e}", level="error"
+                )
+
             with self._trade_lock:
                 self.active_trades[symbol] = {
+                    "trade_id": trade_id,
                     "sl": signal["stopLoss"],
                     "target": signal["target"],
                     "direction": signal["direction"],
@@ -307,6 +376,10 @@ class TradingEngine:
                 }
             return True
         except Exception as e:
+            with self._trade_lock:
+                self._reserved_entry_margin = max(
+                    0, self._reserved_entry_margin - locals().get("reserved_margin", 0)
+                )
             self._push_log(f"Failed to execute signal: {e}")
             return False
 
@@ -347,11 +420,16 @@ class TradingEngine:
                 tracked = set(self.active_trades.keys())
                 pending = set(self._pending_entries)
 
-            # Manual closures: cancel the broker stop (network), then drop tracking.
+            # Manual closures: the position is flat but we still track it — it was
+            # closed outside the app-side exit path, most often by the broker-side
+            # protective stop filling (also: a manual close in the Kite app). Book
+            # the close in the journal so the trade doesn't stay OPEN forever and
+            # is included in analytics, then cancel any leftover stop and drop it.
             for symbol in symbols_to_remove:
                 self._push_log(
-                    f"Detected manual closure for {symbol}. Removing from tracking."
+                    f"Detected external closure for {symbol}. Removing from tracking."
                 )
+                self._journal_external_close(symbol)
                 self._cancel_protective_stop(symbol)
                 with self._trade_lock:
                     self.active_trades.pop(symbol, None)
@@ -468,10 +546,30 @@ class TradingEngine:
             adopted_signal, abs(p["quantity"]), exchange, p.get("product", "MIS")
         )
 
+        trade_id = str(uuid.uuid4())
+        try:
+            journal.open_trade(
+                trade_id=trade_id,
+                tradingsymbol=symbol,
+                exchange=exchange,
+                direction=direction,
+                product=p.get("product", "MIS"),
+                strategy="manual",
+                entry_price=avg_price,
+                quantity=abs(p["quantity"]),
+                stop_loss=sl,
+                target=target,
+            )
+        except Exception as e:
+            self._push_log(
+                f"Failed to log adopted trade for {symbol}: {e}", level="error"
+            )
+
         with self._trade_lock:
             lost_race = symbol in self.active_trades or symbol in self._pending_entries
             if not lost_race:
                 self.active_trades[symbol] = {
+                    "trade_id": trade_id,
                     "sl": sl,
                     "target": target,
                     "direction": direction,
@@ -597,6 +695,25 @@ class TradingEngine:
                     f"Thesis valid for {symbol}: {supporting} supporting, {opposing} opposing. Holding."
                 )
 
+            with self._trade_lock:
+                trade = self.active_trades.get(symbol)
+                trade_id = trade.get("trade_id") if trade else None
+
+            if trade_id:
+                try:
+                    journal.log_event(
+                        trade_id,
+                        "thesis_reevaluation",
+                        {
+                            "supporting": supporting,
+                            "opposing": opposing,
+                            "ltp": ltp,
+                            "mins_held": mins_held,
+                        },
+                    )
+                except Exception:
+                    pass
+
     def _tighten_to_breakeven(self, symbol: str):
         """Move the stop-loss to the entry price (breakeven), both in-memory and broker-side."""
         with self._trade_lock:
@@ -630,6 +747,23 @@ class TradingEngine:
                     trigger_price=trigger_price,
                     price=limit_price,
                 )
+                with self._trade_lock:
+                    trade = self.active_trades.get(symbol, {})
+                    trade_id = trade.get("trade_id")
+
+                if trade_id:
+                    try:
+                        journal.log_event(
+                            trade_id,
+                            "stop_modified",
+                            {
+                                "trigger_price": trigger_price,
+                                "limit_price": limit_price,
+                                "reason": "breakeven",
+                            },
+                        )
+                    except Exception:
+                        pass
             except Exception as e:
                 self._push_log(
                     f"Failed to modify broker-side stop for {symbol} to breakeven ₹{entry_price}: {e}",
@@ -657,19 +791,48 @@ class TradingEngine:
         except Exception as e:
             self._push_log(f"Error in square off: {e}")
 
-    def _wait_for_entry_fill(self, signal: dict, order_id: str) -> dict:
+    def _wait_for_entry_fill(
+        self, signal: dict, order_id: str, baseline_quantity: int = 0
+    ) -> dict:
         deadline = time.time() + self._entry_fill_timeout_seconds
         symbol = signal["tradingsymbol"]
         direction = signal["direction"]
         while time.time() <= deadline:
             position = self._find_live_position(symbol, direction)
-            if position:
+            filled_quantity = abs(position.get("quantity", 0)) if position else 0
+            order = self._find_order(order_id)
+            if position and (
+                not order
+                or filled_quantity > baseline_quantity
+                and str(order.get("status", "")).upper()
+                in {
+                    "COMPLETE",
+                    "CANCELLED",
+                }
+            ):
                 return position
 
-            if self._is_order_closed_without_fill(order_id):
+            if order and str(order.get("status", "")).upper() in {
+                "REJECTED",
+                "CANCELLED",
+            }:
                 return {}
 
             time.sleep(self._entry_fill_poll_seconds)
+
+        try:
+            kite_client.cancel_order("regular", order_id)
+        except Exception:
+            pass
+        position = self._find_live_position(symbol, direction)
+        if abs(position.get("quantity", 0)) > baseline_quantity:
+            return position
+        return {}
+
+    def _find_order(self, order_id: str) -> dict:
+        for order in kite_client.get_orders():
+            if str(order.get("orderId")) == str(order_id):
+                return order
         return {}
 
     def _find_live_position(self, symbol: str, direction: str) -> dict:
@@ -729,6 +892,23 @@ class TradingEngine:
             self._push_log(
                 f"Placed protective stop for {symbol} at trigger ₹{trigger_price}, limit ₹{limit_price}, order_id {order_id}"
             )
+            with self._trade_lock:
+                trade = self.active_trades.get(symbol, {})
+                trade_id = trade.get("trade_id")
+
+            if trade_id:
+                try:
+                    journal.log_event(
+                        trade_id,
+                        "stop_placed",
+                        {
+                            "trigger_price": trigger_price,
+                            "limit_price": limit_price,
+                            "order_id": order_id,
+                        },
+                    )
+                except Exception:
+                    pass
             return order_id
         except Exception as e:
             self._push_log(
@@ -815,6 +995,7 @@ class TradingEngine:
         with self._trade_lock:
             if symbol in self.active_trades:
                 self.active_trades[symbol]["exit_order_id"] = order_id
+                self.active_trades[symbol]["exit_reason"] = reason
         reason_prefix = f"{reason}: " if reason else ""
         self._push_log(f"{reason_prefix}exit order placed for {symbol} ({tx_type})")
 
@@ -843,11 +1024,68 @@ class TradingEngine:
                         level="warning",
                     )
                 elif status == "COMPLETE":
+                    trade_id = self.active_trades[symbol].get("trade_id")
+                    exit_reason = self.active_trades[symbol].get(
+                        "exit_reason", "unknown"
+                    )
+                    avg_price = float(order.get("averagePrice") or 0)
+
+                    if trade_id:
+                        try:
+                            journal.close_trade(trade_id, avg_price, exit_reason)
+                        except Exception as e:
+                            self._push_log(
+                                f"Error closing trade in journal for {symbol}: {e}",
+                                level="error",
+                            )
+
                     self._push_log(
                         f"Exit order {order_id} for {symbol} filled. Removing from tracking."
                     )
                     del self.active_trades[symbol]
             break
+
+    def _journal_external_close(self, symbol: str):
+        """Book a journal close for a position closed outside the app-side exit
+        path (broker-stop fill or a manual close in Kite). Uses the current LTP
+        as the exit price and infers the reason from the protective stop's
+        status."""
+        with self._trade_lock:
+            trade = self.active_trades.get(symbol)
+            if not trade:
+                return
+            trade_id = trade.get("trade_id")
+            stop_order_id = trade.get("stop_order_id")
+            exchange = trade.get("exchange", "NSE")
+        if not trade_id:
+            return
+
+        # Exit price: best available post-hoc estimate is the current LTP.
+        exit_price = 0.0
+        try:
+            data = kite_client.get_ltp([f"{exchange}:{symbol}"])
+            exit_price = (data.get(f"{exchange}:{symbol}") or {}).get("last_price", 0.0)
+        except Exception:
+            pass
+
+        # If the protective stop shows COMPLETE, the stop closed it.
+        reason = "closed_externally"
+        if stop_order_id:
+            try:
+                for o in kite_client.get_orders():
+                    if str(o.get("orderId")) == str(stop_order_id):
+                        if str(o.get("status", "")).upper() == "COMPLETE":
+                            reason = "stop_loss"
+                        break
+            except Exception:
+                pass
+
+        try:
+            journal.close_trade(trade_id, exit_price, reason)
+        except Exception as e:
+            self._push_log(
+                f"Error closing trade in journal for {symbol}: {e}", level="error"
+            )
 
 
 trading_engine = TradingEngine()

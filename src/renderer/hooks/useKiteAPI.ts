@@ -1,13 +1,49 @@
 import { useEffect } from 'react';
 import { useTradingStore } from '../stores/trading-store';
 import * as IPC from '@shared/ipc-channels';
-import { OrderRequest, KiteCredentials } from '@shared/types';
+import { OrderRequest, KiteCredentials, StrategyName } from '@shared/types';
 
 export interface ElectronAPI {
+  isDevMode?: boolean;
   invoke(channel: string, ...args: any[]): Promise<any>;
   on(channel: string, listener: (...args: any[]) => void): void;
   removeListener(channel: string, listener: (...args: any[]) => void): void;
   removeAllListeners(channel: string): void;
+  dashboard: {
+    summary(): Promise<any>;
+  };
+  portfolio: {
+    positions(): Promise<any>;
+    holdings(): Promise<any>;
+    margins(): Promise<any>;
+  };
+  orders: {
+    place(orderParams: any): Promise<any>;
+    modify(orderParams: any): Promise<any>;
+    cancel(orderId: string, variety: string): Promise<any>;
+    getAll(): Promise<any>;
+    getTrades(): Promise<any>;
+  };
+  journal: {
+    getTrades(): Promise<any>;
+    getEvents(tradeId: string): Promise<any>;
+  };
+  settings: {
+    get(): Promise<any>;
+    save(settings: any): Promise<any>;
+    saveLlmKey(key: string): Promise<any>;
+    discoverModels(params: any): Promise<any>;
+    reset(): Promise<any>;
+  };
+  analytics: {
+    getStrategyExpectancy(): Promise<any>;
+    getConfluenceValidation(): Promise<any>;
+    getConfidenceCalibration(): Promise<any>;
+    getExitReasonEffectiveness(): Promise<any>;
+    getTradeReplay(tradeId: string): Promise<any>;
+    getWhatIfAnalysis(tradeId: string): Promise<any>;
+    getLlmPostMortem(tradeId: string): Promise<any>;
+  };
 }
 
 declare global {
@@ -22,18 +58,18 @@ export const useKiteAPI = () => {
   useEffect(() => {
     if (!window.electronAPI) return;
 
-    const unsubTick = window.electronAPI.on(IPC.TICKER_TICK, (event: any, data: any) => {
+    window.electronAPI.on(IPC.TICKER_TICK, (event: any, data: any) => {
        if (data && data.tradingsymbol) {
          store.updateTick(data.tradingsymbol, data);
        }
     });
-    const unsubSignal = window.electronAPI.on(IPC.AGENT_SIGNAL, (event: any, data: any) => {
+    window.electronAPI.on(IPC.AGENT_SIGNAL, (event: any, data: any) => {
        store.addSignal(data);
     });
-    const unsubLog = window.electronAPI.on(IPC.LOG_ENTRY, (event: any, data: any) => {
+    window.electronAPI.on(IPC.LOG_ENTRY, (event: any, data: any) => {
        store.addLogEntry(data);
     });
-    const unsubAgentState = window.electronAPI.on(IPC.AGENT_STATE_UPDATE, (event: any, data: any) => {
+    window.electronAPI.on(IPC.AGENT_STATE_UPDATE, (event: any, data: any) => {
        store.setAgentState(data);
     });
 
@@ -46,12 +82,21 @@ export const useKiteAPI = () => {
         }
         const agentStat = await window.electronAPI?.invoke(IPC.AGENT_STATUS);
         if (agentStat) {
-          store.setAgentState({ running: agentStat.running, mode: agentStat.mode || 'confirm' });
+          store.setAgentState({ running: agentStat.running, mode: agentStat.mode || 'auto' });
         }
         const settings = await window.electronAPI?.invoke(IPC.SETTINGS_GET);
-        if (settings && settings.strategies) {
-           const enabledStrats = Object.keys(settings.strategies).filter(s => settings.strategies[s].enabled);
-           store.setAgentState({ enabledStrategies: enabledStrats });
+        if (settings) {
+           if (settings.strategies) {
+             const enabledStrats = Object.keys(settings.strategies).filter(
+               s => settings.strategies[s].enabled
+             ) as StrategyName[];
+             store.setAgentState({ enabledStrategies: enabledStrats });
+           }
+           if (settings.mode) {
+             store.setAgentState({ mode: settings.mode });
+           } else {
+             store.setAgentState({ mode: 'auto' });
+           }
            store.setSettings(settings);
         }
       } catch (e) {

@@ -1,16 +1,36 @@
 import React, { useState, useEffect } from 'react';
 import { useTradingStore } from '../stores/trading-store';
 import { SETTINGS_SAVE } from '@shared/ipc-channels';
+import { LLMSettings, OpenCodePlan } from '@shared/types';
+
+const LLM_PROVIDERS = ['OpenAI', 'Anthropic', 'Gemini', 'OpenRouter', 'Ollama', 'OpenCode'] as const;
+const LLM_PRESETS: Record<string, Partial<LLMSettings>> = {
+  OpenAI: { baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
+  Anthropic: { baseUrl: 'https://api.anthropic.com/v1', model: 'claude-3-5-haiku-latest' },
+  Gemini: { baseUrl: 'https://generativelanguage.googleapis.com/v1beta', model: 'gemini-2.5-flash' },
+  OpenRouter: { baseUrl: 'https://openrouter.ai/api/v1', model: 'openai/gpt-4o-mini' },
+  Ollama: { baseUrl: 'http://localhost:11434', model: 'llama3.2' },
+  OpenCode: { baseUrl: 'https://opencode.ai/zen/v1', model: 'big-pickle' },
+};
+const OPENCODE_PLAN_PRESETS: Record<OpenCodePlan, Partial<LLMSettings>> = {
+  zen: { baseUrl: 'https://opencode.ai/zen/v1', model: 'big-pickle', openCodePlan: 'zen' },
+  go: { baseUrl: 'https://opencode.ai/zen/go/v1', model: 'kimi-k3', openCodePlan: 'go' },
+};
 
 const Settings: React.FC = () => {
   const { settings, setSettings } = useTradingStore();
   const [localSettings, setLocalSettings] = useState<any>(settings);
   const [saveStatus, setSaveStatus] = useState<string>('');
+  const [llmKey, setLlmKey] = useState<string>('');
+  const [models, setModels] = useState<string[]>([]);
+  const [discovering, setDiscovering] = useState(false);
+  const [discoveryError, setDiscoveryError] = useState('');
 
   // Sync local state when global settings load
   useEffect(() => {
     if (settings) {
       setLocalSettings(settings);
+      setLlmKey('');
     }
   }, [settings]);
 
@@ -20,7 +40,7 @@ const Settings: React.FC = () => {
 
   const handleRiskChange = (key: string, value: string | boolean) => {
     setLocalSettings((prev: any) => {
-      let finalValue = value;
+      let finalValue: string | number | boolean = value;
       if (typeof value === 'string' && !value.includes(':')) {
         finalValue = parseFloat(value) || 0;
       }
@@ -34,11 +54,48 @@ const Settings: React.FC = () => {
     });
   };
 
+  const updateLlm = (changes: Partial<LLMSettings>) => {
+    setLocalSettings((prev: any) => prev ? ({ ...prev, llm: { ...prev.llm, ...changes } }) : prev);
+  };
+
+  const handleProviderChange = (provider: string) => {
+    updateLlm({ provider: provider as LLMSettings['provider'], ...(provider === 'OpenCode' ? OPENCODE_PLAN_PRESETS.zen : LLM_PRESETS[provider] || {}) });
+    setModels([]);
+    setDiscoveryError('');
+  };
+
+  const handleOpenCodePlanChange = (plan: OpenCodePlan) => {
+    updateLlm(OPENCODE_PLAN_PRESETS[plan]);
+    setModels([]);
+    setDiscoveryError('');
+  };
+
+  const discoverModels = async () => {
+    try {
+      setDiscovering(true);
+      const result = await window.electronAPI?.settings.discoverModels({
+          provider: localSettings.llm.provider,
+          baseUrl: localSettings.llm.baseUrl,
+          openCodePlan: localSettings.llm.openCodePlan || 'zen',
+          apiKey: llmKey,
+       });
+       if (Array.isArray(result)) setModels(result);
+     } catch (error) {
+       setDiscoveryError(error instanceof Error ? error.message : 'Model discovery failed');
+     } finally {
+      setDiscovering(false);
+    }
+  };
+
   const saveChanges = async () => {
     try {
       setSaveStatus('Saving...');
-      await window.electronAPI?.invoke(SETTINGS_SAVE, localSettings);
-      setSettings(localSettings);
+      await window.electronAPI?.invoke(SETTINGS_SAVE, {
+        ...localSettings,
+        llm: { ...localSettings.llm, apiKey: llmKey },
+      });
+      
+      setSettings({ ...localSettings, llm: { ...localSettings.llm, apiKey: '' } });
       setSaveStatus('Saved successfully!');
       setTimeout(() => setSaveStatus(''), 3000);
     } catch (error) {
@@ -78,6 +135,19 @@ const Settings: React.FC = () => {
           <section className="bg-surface-800 p-6 rounded-xl border border-surface-700">
             <h2 className="text-lg font-semibold text-white mb-4">API Credentials</h2>
             <div className="space-y-4">
+              {localSettings.llm?.provider === 'OpenCode' && (
+                <div>
+                  <label className="block text-surface-400 text-sm mb-1">OpenCode plan</label>
+                  <select
+                    value={localSettings.llm.openCodePlan || 'zen'}
+                    onChange={(e) => handleOpenCodePlanChange(e.target.value as OpenCodePlan)}
+                    className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white"
+                  >
+                    <option value="zen">Zen</option>
+                    <option value="go">Go</option>
+                  </select>
+                </div>
+              )}
               <div>
                 <label className="block text-surface-400 text-sm mb-1">Kite API Key</label>
                 <input type="password" value="••••••••••••••••" readOnly className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white" />
@@ -87,6 +157,50 @@ const Settings: React.FC = () => {
                 <input type="password" value="••••••••••••••••" readOnly className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white" />
               </div>
               <p className="text-xs text-surface-500">To update credentials, log out and enter them on the login screen.</p>
+            </div>
+          </section>
+
+          <section className="bg-surface-800 p-6 rounded-xl border border-surface-700">
+            <h2 className="text-lg font-semibold text-white mb-4">BYOK LLM Post-Mortems</h2>
+            <div className="space-y-4">
+              <div>
+                <label className="block text-surface-400 text-sm mb-1">Provider</label>
+                <select
+                  value={localSettings.llm?.provider || 'Gemini'}
+                  onChange={(e) => handleProviderChange(e.target.value)}
+                  className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white"
+                >
+                   {LLM_PROVIDERS.map((provider) => <option key={provider}>{provider}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className="block text-surface-400 text-sm mb-1">Model</label>
+                <div className="flex gap-2">
+                  <select value={localSettings.llm?.model || ''} onChange={(e) => updateLlm({ model: e.target.value })}
+                    className="flex-1 bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white focus:border-accent-light outline-none">
+                    <option value={localSettings.llm?.model || ''}>{localSettings.llm?.model || 'Select a model'}</option>
+                    {models.filter((model) => model !== localSettings.llm?.model).map((model) => <option key={model}>{model}</option>)}
+                  </select>
+                  <button type="button" onClick={discoverModels} disabled={discovering}
+                    className="px-3 py-2 bg-surface-700 hover:bg-surface-600 rounded-lg text-white disabled:opacity-50">
+                    {discovering ? 'Loading...' : 'Refresh'}
+                  </button>
+                </div>
+              </div>
+              <div>
+                <label className="block text-surface-400 text-sm mb-1">API Key</label>
+                <input 
+                   type="password"
+                   value={llmKey}
+                   onChange={(e) => setLlmKey(e.target.value)}
+                   placeholder={localSettings.llm?.apiKeyConfigured ? 'Key saved (enter to replace)' : localSettings.llm?.provider === 'Ollama' ? 'Optional Ollama Cloud API key' : 'Enter provider API key'}
+                  className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white focus:border-accent-light outline-none" 
+                />
+              </div>
+               {discoveryError && (
+                 <p role="alert" className="text-sm text-loss-light">Model discovery failed: {discoveryError}</p>
+               )}
+                <p className="text-xs text-surface-500">Used for trade post-mortems in the Journal. Keys are encrypted locally. Ollama runs locally without a key, or use an Ollama Cloud key.</p>
             </div>
           </section>
 

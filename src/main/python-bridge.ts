@@ -133,7 +133,8 @@ class PythonBridge {
       
       if (pendingReq) {
         if (response.error) {
-          pendingReq.reject(response.error);
+          const errMsg = response.error.message || JSON.stringify(response.error);
+          pendingReq.reject(new Error(errMsg));
         } else {
           pendingReq.resolve(response.result);
         }
@@ -144,7 +145,7 @@ class PythonBridge {
     else if (msg && typeof msg.event === 'string') {
       const eventMsg = msg as RPCEvent;
       // Broadcast to renderer
-      let channel = eventMsg.event;
+      const channel = eventMsg.event;
       // Map event names to channels if necessary, or assume they match
       this.broadcastToRenderer(channel, eventMsg.data);
     }

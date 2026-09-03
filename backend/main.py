@@ -2,8 +2,11 @@ import json
 import sys
 import traceback
 
+from .analytics import analytics
 from .config import config_manager
+from .journal import journal
 from .kite_client import kite_client
+from .llm_client import OPENCODE_PLANS, OpenAICompatibleClient
 from .scanner import scanner
 from .ticker import ticker_manager
 from .trading_engine import trading_engine
@@ -47,6 +50,12 @@ def handle_request(req):
 
             kite_client.init(api_key)
             kite_client.set_access_token(access_token)
+
+            # Verify the token is actually still valid with the Kite API
+            try:
+                kite_client.get_margins()
+            except Exception:
+                return success({"is_valid": False})
 
             # Start ticker on resume
             ticker_manager.start(api_key, access_token)
@@ -112,7 +121,7 @@ def handle_request(req):
             return success(kite_client.search_instruments(params.get("query", "")))
 
         elif method == "start_agent":
-            mode = params.get("mode", "confirm")
+            mode = params.get("mode", "auto")
             trading_engine.start(mode)
             return success({"status": "started", "mode": mode})
 
@@ -124,19 +133,44 @@ def handle_request(req):
             return success(trading_engine.status())
 
         elif method == "get_settings":
-            return success(config_manager.config)
+            return success(config_manager.get_settings())
 
         elif method == "save_settings":
-            config_manager.config.update(params)
-            config_manager.save()
+            config_manager.save_settings(params)
             return success({"status": "saved"})
 
+        elif method == "save_llm_api_key":
+            config_manager.save_llm_api_key(params.get("llmApiKey", ""))
+            return success({"status": "saved"})
+
+        elif method == "discover_models":
+            llm = config_manager.get_llm_settings()
+            credentials = config_manager.get_credentials()
+            api_key = params.get("apiKey") or credentials.get("llmApiKey", "")
+            provider = params.get("provider", llm.get("provider", "Gemini"))
+            base_url = params.get("baseUrl", llm.get("baseUrl", ""))
+            plan = params.get("openCodePlan", llm.get("openCodePlan", "zen"))
+            if provider == "OpenCode":
+                plan = plan if plan in OPENCODE_PLANS else "zen"
+                base_url = OPENCODE_PLANS[plan]["baseUrl"]
+            if provider != "Ollama" and not api_key:
+                return error(-32602, "LLM API Key not configured in settings.")
+            if provider == "OpenCode":
+                models = OpenAICompatibleClient().discover_models(
+                    provider, base_url, api_key, plan=plan
+                )
+            else:
+                models = OpenAICompatibleClient().discover_models(
+                    provider, base_url, api_key
+                )
+            return success(models)
+
         elif method == "scan_now":
-            from .nifty_universe import get_nifty50_universe
+            from .nifty_universe import get_nifty100_universe
             from .screener import screener_engine
 
             custom_watchlist = config_manager.get_watchlist()
-            full_universe = list(set(get_nifty50_universe() + custom_watchlist))
+            full_universe = list(set(get_nifty100_universe() + custom_watchlist))
 
             # Run the AI screener
             top_stocks = screener_engine.generate_daily_watchlist(
@@ -192,6 +226,33 @@ def handle_request(req):
         elif method == "execute_signal":
             res = trading_engine.execute_signal(params.get("signal", {}))
             return success({"executed": res})
+
+        elif method == "journal_get_trades":
+            return success(journal.get_trades())
+
+        elif method == "journal_get_events":
+            return success(journal.get_trade_events(params.get("trade_id")))
+
+        elif method == "analytics_strategy_expectancy":
+            return success(analytics.get_strategy_expectancy())
+
+        elif method == "analytics_confluence_validation":
+            return success(analytics.get_confluence_validation())
+
+        elif method == "analytics_confidence_calibration":
+            return success(analytics.get_confidence_calibration())
+
+        elif method == "analytics_exit_reason_effectiveness":
+            return success(analytics.get_exit_reason_effectiveness())
+
+        elif method == "analytics_trade_replay":
+            return success(analytics.get_trade_replay(params.get("trade_id")))
+
+        elif method == "analytics_what_if":
+            return success(analytics.get_what_if_analysis(params.get("trade_id")))
+
+        elif method == "analytics_llm_post_mortem":
+            return success(analytics.generate_llm_post_mortem(params.get("trade_id")))
 
         else:
             return error(-32601, f"Method '{method}' not found")

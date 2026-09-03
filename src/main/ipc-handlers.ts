@@ -150,8 +150,16 @@ export function setupIpcHandlers() {
     return await pythonBridge.call('get_settings');
   });
   
-  ipcMain.handle(channels.SETTINGS_SAVE, async (_, settings: any) => {
-    return await pythonBridge.call('save_settings', settings);
+  ipcMain.handle(channels.SETTINGS_SAVE, async (_, settings: AppSettings) => {
+    return await pythonBridge.call('save_settings', settings as unknown as Record<string, unknown>);
+  });
+  
+  ipcMain.handle(channels.SETTINGS_SAVE_LLM_KEY, async (_, llmApiKey: string) => {
+    return await pythonBridge.call('save_llm_api_key', { llmApiKey });
+  });
+
+  ipcMain.handle(channels.SETTINGS_DISCOVER_MODELS, async (_, params: any) => {
+    return await pythonBridge.call('discover_models', params);
   });
   
   ipcMain.handle(channels.SETTINGS_RESET, async () => {
@@ -176,5 +184,43 @@ export function setupIpcHandlers() {
   
   ipcMain.handle(channels.DASHBOARD_SUMMARY, async () => {
     return await pythonBridge.call('dashboard_summary');
+  });
+
+  // ─── Journal & Analytics ──────────────────────────────────────────
+
+  ipcMain.handle(channels.JOURNAL_GET_TRADES, async () => {
+    return await pythonBridge.call('journal_get_trades');
+  });
+
+  ipcMain.handle(channels.JOURNAL_GET_EVENTS, async (_, trade_id: string) => {
+    return await pythonBridge.call('journal_get_events', { trade_id });
+  });
+
+  ipcMain.handle(channels.ANALYTICS_STRATEGY_EXPECTANCY, async () => {
+    return await pythonBridge.call('analytics_strategy_expectancy');
+  });
+
+  ipcMain.handle(channels.ANALYTICS_CONFLUENCE_VALIDATION, async () => {
+    return await pythonBridge.call('analytics_confluence_validation');
+  });
+
+  ipcMain.handle(channels.ANALYTICS_CONFIDENCE_CALIBRATION, async () => {
+    return await pythonBridge.call('analytics_confidence_calibration');
+  });
+
+  ipcMain.handle(channels.ANALYTICS_EXIT_REASON, async () => {
+    return await pythonBridge.call('analytics_exit_reason_effectiveness');
+  });
+
+  ipcMain.handle(channels.ANALYTICS_TRADE_REPLAY, async (_, trade_id: string) => {
+    return await pythonBridge.call('analytics_trade_replay', { trade_id });
+  });
+
+  ipcMain.handle(channels.ANALYTICS_WHAT_IF, async (_, trade_id: string) => {
+    return await pythonBridge.call('analytics_what_if', { trade_id });
+  });
+
+  ipcMain.handle(channels.ANALYTICS_LLM_POST_MORTEM, async (_, trade_id: string) => {
+    return await pythonBridge.call('analytics_llm_post_mortem', { trade_id });
   });
 }
